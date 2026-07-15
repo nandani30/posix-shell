@@ -2,6 +2,8 @@
 #include <string>
 #include <vector>
 #include <cctype>
+#include <unistd.h>     // For fork(), execvp()
+#include <sys/wait.h>   // For waitpid()
 
 std::vector<std::string> tokenize(const std::string& input) {
     std::vector<std::string> tokens;
@@ -13,32 +15,24 @@ std::vector<std::string> tokenize(const std::string& input) {
         char c = input[i];
 
         if (c == '\'' && !in_double_quote) {
-            // Toggle single quote state
             in_single_quote = !in_single_quote;
-            // Note: We deliberately do NOT add the quote character to current_token
         } else if (c == '"' && !in_single_quote) {
-            // Toggle double quote state
             in_double_quote = !in_double_quote;
-            // Note: We deliberately do NOT add the quote character to current_token
         } else if (std::isspace(c) && !in_single_quote && !in_double_quote) {
-            // Unquoted whitespace: end of the current token
             if (!current_token.empty()) {
                 tokens.push_back(current_token);
                 current_token.clear();
             }
         } else {
-            // Any other character belongs to the current token
             current_token += c;
         }
     }
 
-    // Edge case: User typed a quote but didn't close it (e.g., `echo "hello`)
     if (in_single_quote || in_double_quote) {
         std::cerr << "myshell: syntax error: unterminated quote\n";
-        return {}; // Return empty vector to discard the line
+        return {};
     }
 
-    // Add the final token if the string didn't end with a space
     if (!current_token.empty()) {
         tokens.push_back(current_token);
     }
@@ -46,36 +40,59 @@ std::vector<std::string> tokenize(const std::string& input) {
     return tokens;
 }
 
+void execute_command(const std::vector<std::string>& tokens) {
+    if (tokens.empty()) return;
+
+    // Convert vector of std::string to array of char* for execvp
+    std::vector<char*> args;
+    for (const auto& token : tokens) {
+        args.push_back(const_cast<char*>(token.c_str()));
+    }
+    args.push_back(nullptr); // The array must be null-terminated
+
+    // fork() creates a new process by duplicating the calling process
+    pid_t pid = fork();
+
+    if (pid < 0) {
+        // Error occurred during fork
+        std::cerr << "myshell: fork failed\n";
+    } else if (pid == 0) {
+        // We are in the child process
+        // execvp replaces the current process image with a new process image
+        if (execvp(args[0], args.data()) == -1) {
+            // If execvp returns, an error occurred
+            std::cerr << "myshell: " << args[0] << ": command not found\n";
+            exit(1); // Exit the child process immediately
+        }
+    } else {
+        // We are in the parent process (the shell)
+        // Wait for the specific child process (pid) to change state (finish)
+        int status;
+        waitpid(pid, &status, 0);
+    }
+}
+
 int main() {
     std::string input;
 
-    // The REPL (Read-Eval-Print Loop)
     while (true) {
-        // Print the prompt
         std::cout << "myshell> ";
-        std::cout.flush(); // Ensure the prompt is printed immediately
+        std::cout.flush();
 
-        // Read input
         if (!std::getline(std::cin, input)) {
-            // EOF reached (e.g., Ctrl+D)
             std::cout << "\n";
             break;
         }
 
-        // If the user just pressed Enter, do nothing and prompt again
         if (input.empty()) {
             continue;
         }
 
-        // Tokenize the input string
         std::vector<std::string> tokens = tokenize(input);
 
-        // Eval/Print (Placeholder for future milestones)
-        // For Milestone 2: just print the parsed tokens to verify correctness
+        // Execute the parsed tokens
         if (!tokens.empty()) {
-            for (size_t i = 0; i < tokens.size(); ++i) {
-                std::cout << "Token " << i << ": [" << tokens[i] << "]\n";
-            }
+            execute_command(tokens);
         }
     }
 

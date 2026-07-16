@@ -2,8 +2,9 @@
 #include <string>
 #include <vector>
 #include <cctype>
-#include <unistd.h>     // For fork(), execvp()
+#include <unistd.h>     // For fork(), execvp(), chdir(), getcwd()
 #include <sys/wait.h>   // For waitpid()
+#include <cstdlib>      // For exit()
 
 std::vector<std::string> tokenize(const std::string& input) {
     std::vector<std::string> tokens;
@@ -38,6 +39,52 @@ std::vector<std::string> tokenize(const std::string& input) {
     }
 
     return tokens;
+}
+
+// Function to handle built-in commands
+// Returns true if a built-in was executed (or attempted), false if it's not a built-in
+bool execute_builtin(const std::vector<std::string>& tokens) {
+    if (tokens.empty()) return false;
+    const std::string& cmd = tokens[0];
+
+    if (cmd == "exit") {
+        // Exit the shell process gracefully
+        std::cout << "Exiting myshell...\n";
+        exit(0);
+    } 
+    else if (cmd == "help") {
+        std::cout << "myshell - A custom Unix shell\n";
+        std::cout << "Built-in commands:\n";
+        std::cout << "  cd [dir] - Change the current directory\n";
+        std::cout << "  pwd      - Print the current working directory\n";
+        std::cout << "  help     - Show this help message\n";
+        std::cout << "  exit     - Exit the shell\n";
+        return true;
+    } 
+    else if (cmd == "cd") {
+        if (tokens.size() < 2) {
+            std::cerr << "myshell: cd: missing argument\n";
+        } else {
+            // chdir changes the current working directory of the calling process
+            if (chdir(tokens[1].c_str()) != 0) {
+                // perror prints the given string followed by the system error message (e.g., "No such file or directory")
+                perror("myshell: cd");
+            }
+        }
+        return true;
+    } 
+    else if (cmd == "pwd") {
+        char cwd[1024];
+        // getcwd fills the buffer with the absolute path of the current working directory
+        if (getcwd(cwd, sizeof(cwd)) != nullptr) {
+            std::cout << cwd << "\n";
+        } else {
+            perror("myshell: pwd");
+        }
+        return true;
+    }
+
+    return false;
 }
 
 void execute_command(const std::vector<std::string>& tokens) {
@@ -90,9 +137,12 @@ int main() {
 
         std::vector<std::string> tokens = tokenize(input);
 
-        // Execute the parsed tokens
         if (!tokens.empty()) {
-            execute_command(tokens);
+            // First, check if the command is a built-in
+            if (!execute_builtin(tokens)) {
+                // If not a built-in, execute it as an external command
+                execute_command(tokens);
+            }
         }
     }
 

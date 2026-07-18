@@ -2,9 +2,10 @@
 #include <string>
 #include <vector>
 #include <cctype>
-#include <unistd.h>     // For fork(), execvp(), chdir(), getcwd()
+#include <unistd.h>     // For fork(), execvp(), chdir(), getcwd(), dup2()
 #include <sys/wait.h>   // For waitpid()
 #include <cstdlib>      // For exit()
+#include <fcntl.h>      // For open() and O_* flags
 
 std::vector<std::string> tokenize(const std::string& input) {
     std::vector<std::string> tokens;
@@ -41,14 +42,11 @@ std::vector<std::string> tokenize(const std::string& input) {
     return tokens;
 }
 
-// Function to handle built-in commands
-// Returns true if a built-in was executed (or attempted), false if it's not a built-in
 bool execute_builtin(const std::vector<std::string>& tokens) {
     if (tokens.empty()) return false;
     const std::string& cmd = tokens[0];
 
     if (cmd == "exit") {
-        // Exit the shell process gracefully
         std::cout << "Exiting myshell...\n";
         exit(0);
     } 
@@ -65,9 +63,7 @@ bool execute_builtin(const std::vector<std::string>& tokens) {
         if (tokens.size() < 2) {
             std::cerr << "myshell: cd: missing argument\n";
         } else {
-            // chdir changes the current working directory of the calling process
             if (chdir(tokens[1].c_str()) != 0) {
-                // perror prints the given string followed by the system error message (e.g., "No such file or directory")
                 perror("myshell: cd");
             }
         }
@@ -75,7 +71,6 @@ bool execute_builtin(const std::vector<std::string>& tokens) {
     } 
     else if (cmd == "pwd") {
         char cwd[1024];
-        // getcwd fills the buffer with the absolute path of the current working directory
         if (getcwd(cwd, sizeof(cwd)) != nullptr) {
             std::cout << cwd << "\n";
         } else {
@@ -90,30 +85,87 @@ bool execute_builtin(const std::vector<std::string>& tokens) {
 void execute_command(const std::vector<std::string>& tokens) {
     if (tokens.empty()) return;
 
-    // Convert vector of std::string to array of char* for execvp
     std::vector<char*> args;
-    for (const auto& token : tokens) {
-        args.push_back(const_cast<char*>(token.c_str()));
-    }
-    args.push_back(nullptr); // The array must be null-terminated
+    std::string input_file = "";
+    std::string output_file = "";
+    bool append_output = false;
 
-    // fork() creates a new process by duplicating the calling process
+    // Scan for redirection operators and build the clean args array
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i] == "<") {
+            if (i + 1 < tokens.size()) {
+                input_file = tokens[i + 1];
+                ++i; // skip the filename token
+            } else {
+                std::cerr << "myshell: syntax error near unexpected token `newline'\n";
+                return;
+            }
+        } else if (tokens[i] == ">") {
+            if (i + 1 < tokens.size()) {
+                output_file = tokens[i + 1];
+                append_output = false;
+                ++i;
+            } else {
+                std::cerr << "myshell: syntax error near unexpected token `newline'\n";
+                return;
+            }
+        } else if (tokens[i] == ">>") {
+            if (i + 1 < tokens.size()) {
+                output_file = tokens[i + 1];
+                append_output = true;
+                ++i;
+            } else {
+                std::cerr << "myshell: syntax error near unexpected token `newline'\n";
+                return;
+            }
+        } else {
+            args.push_back(const_cast<char*>(tokens[i].c_str()));
+        }
+    }
+    
+    // Nothing left to execute (e.g., user just typed `> file.txt`)
+    if (args.empty()) return;
+
+    args.push_back(nullptr); // Null-terminate for execvp
+
     pid_t pid = fork();
 
     if (pid < 0) {
-        // Error occurred during fork
         std::cerr << "myshell: fork failed\n";
     } else if (pid == 0) {
-        // We are in the child process
-        // execvp replaces the current process image with a new process image
+        // --- CHILD PROCESS ---
+        
+        // Handle input redirection `<`
+        if (!input_file.empty()) {
+            int fd0 = open(input_file.c_str(), O_RDONLY);
+            if (fd0 < 0) {
+                perror("myshell");
+                exit(1);
+            }
+            dup2(fd0, STDIN_FILENO); // Replace standard input with our file
+            close(fd0);              // Clean up the original file descriptor
+        }
+
+        // Handle output redirection `>` or `>>`
+        if (!output_file.empty()) {
+            int flags = O_WRONLY | O_CREAT | (append_output ? O_APPEND : O_TRUNC);
+            // 0644 gives rw-r--r-- permissions to the newly created file
+            int fd1 = open(output_file.c_str(), flags, 0644);
+            if (fd1 < 0) {
+                perror("myshell");
+                exit(1);
+            }
+            dup2(fd1, STDOUT_FILENO); // Replace standard output with our file
+            close(fd1);               // Clean up the original file descriptor
+        }
+
+        // Now execute the command. Its stdin/stdout are pointing to the files (if redirected)
         if (execvp(args[0], args.data()) == -1) {
-            // If execvp returns, an error occurred
             std::cerr << "myshell: " << args[0] << ": command not found\n";
-            exit(1); // Exit the child process immediately
+            exit(1); 
         }
     } else {
-        // We are in the parent process (the shell)
-        // Wait for the specific child process (pid) to change state (finish)
+        // --- PARENT PROCESS ---
         int status;
         waitpid(pid, &status, 0);
     }
@@ -138,9 +190,7 @@ int main() {
         std::vector<std::string> tokens = tokenize(input);
 
         if (!tokens.empty()) {
-            // First, check if the command is a built-in
             if (!execute_builtin(tokens)) {
-                // If not a built-in, execute it as an external command
                 execute_command(tokens);
             }
         }

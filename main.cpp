@@ -6,6 +6,7 @@
 #include <sys/wait.h>
 #include <cstdlib>
 #include <fcntl.h>
+#include <csignal>
 
 std::vector<std::string> tokenize(const std::string& input) {
     std::vector<std::string> tokens;
@@ -20,6 +21,26 @@ std::vector<std::string> tokenize(const std::string& input) {
             in_single_quote = !in_single_quote;
         } else if (c == '"' && !in_single_quote) {
             in_double_quote = !in_double_quote;
+        } else if (c == '$' && !in_single_quote) {
+            // Variable expansion (ignored if inside single quotes)
+            std::string var_name;
+            size_t j = i + 1;
+            // Variable names can contain alphanumeric characters and underscores
+            while (j < input.length() && (std::isalnum(input[j]) || input[j] == '_')) {
+                var_name += input[j];
+                j++;
+            }
+            
+            if (!var_name.empty()) {
+                const char* val = getenv(var_name.c_str());
+                if (val != nullptr) {
+                    current_token += val; // Append the expanded value
+                }
+                i = j - 1; // Advance the outer loop iterator past the variable name
+            } else {
+                // A lone '$' sign
+                current_token += '$';
+            }
         } else if (std::isspace(c) && !in_single_quote && !in_double_quote) {
             if (!current_token.empty()) {
                 tokens.push_back(current_token);
@@ -53,19 +74,50 @@ bool execute_builtin(const std::vector<std::string>& tokens) {
     else if (cmd == "help") {
         std::cout << "myshell - A custom Unix shell\n";
         std::cout << "Built-in commands:\n";
-        std::cout << "  cd [dir] - Change the current directory\n";
-        std::cout << "  pwd      - Print the current working directory\n";
-        std::cout << "  help     - Show this help message\n";
-        std::cout << "  exit     - Exit the shell\n";
+        std::cout << "  cd [dir]       - Change the current directory\n";
+        std::cout << "  pwd            - Print the current working directory\n";
+        std::cout << "  export KEY=VAL - Set an environment variable\n";
+        std::cout << "  help           - Show this help message\n";
+        std::cout << "  exit           - Exit the shell\n";
         return true;
     } 
-    else if (cmd == "cd") {
+    else if (cmd == "export") {
         if (tokens.size() < 2) {
-            std::cerr << "myshell: cd: missing argument\n";
+            std::cerr << "myshell: export: missing argument\n";
         } else {
-            if (chdir(tokens[1].c_str()) != 0) {
-                perror("myshell: cd");
+            std::string arg = tokens[1];
+            size_t eq_pos = arg.find('=');
+            if (eq_pos != std::string::npos) {
+                std::string key = arg.substr(0, eq_pos);
+                std::string value = arg.substr(eq_pos + 1);
+                // setenv sets the environment variable in the current process
+                // 1 means overwrite if it already exists
+                if (setenv(key.c_str(), value.c_str(), 1) != 0) {
+                    perror("myshell: export");
+                }
+            } else {
+                std::cerr << "myshell: export: invalid format (expected KEY=VALUE)\n";
             }
+        }
+        return true;
+    }
+    else if (cmd == "cd") {
+        std::string target_dir;
+        if (tokens.size() < 2) {
+            // Default to $HOME if no arguments are provided
+            const char* home = getenv("HOME");
+            if (home != nullptr) {
+                target_dir = home;
+            } else {
+                std::cerr << "myshell: cd: HOME not set\n";
+                return true;
+            }
+        } else {
+            target_dir = tokens[1];
+        }
+
+        if (chdir(target_dir.c_str()) != 0) {
+            perror("myshell: cd");
         }
         return true;
     } 
@@ -81,9 +133,6 @@ bool execute_builtin(const std::vector<std::string>& tokens) {
     return false;
 }
 
-// Executes a single command (handling < and >).
-// If in_child_process is true, this function will call execvp or exit() and NEVER return.
-// If in_child_process is false, it will fork, call execvp in the child, and waitpid in the parent.
 void execute_single_command(const std::vector<std::string>& tokens, bool in_child_process) {
     if (tokens.empty()) {
         if (in_child_process) exit(0);
@@ -95,7 +144,6 @@ void execute_single_command(const std::vector<std::string>& tokens, bool in_chil
     std::string output_file = "";
     bool append_output = false;
 
-    // Scan for redirection operators
     for (size_t i = 0; i < tokens.size(); ++i) {
         if (tokens[i] == "<") {
             if (i + 1 < tokens.size()) { input_file = tokens[i + 1]; ++i; }
@@ -117,8 +165,9 @@ void execute_single_command(const std::vector<std::string>& tokens, bool in_chil
     }
     args.push_back(nullptr);
 
-    // The core execution logic (runs inside child process)
     auto do_exec = [&]() {
+        signal(SIGINT, SIG_DFL);
+
         if (!input_file.empty()) {
             int fd0 = open(input_file.c_str(), O_RDONLY);
             if (fd0 < 0) { perror("myshell"); exit(1); }
@@ -133,7 +182,6 @@ void execute_single_command(const std::vector<std::string>& tokens, bool in_chil
             close(fd1);
         }
 
-        // If it's a built-in running inside a pipeline, execute it and exit the child
         std::vector<std::string> clean_tokens;
         for (int i = 0; args[i] != nullptr; ++i) clean_tokens.push_back(args[i]);
         if (execute_builtin(clean_tokens)) {
@@ -165,7 +213,6 @@ void execute_pipeline(const std::vector<std::string>& tokens) {
     std::vector<std::vector<std::string>> commands;
     std::vector<std::string> current_command;
 
-    // Split tokens by pipe '|'
     for (const auto& token : tokens) {
         if (token == "|") {
             if (!current_command.empty()) {
@@ -185,11 +232,9 @@ void execute_pipeline(const std::vector<std::string>& tokens) {
 
     if (commands.empty()) return;
 
-    // Fast path for single command (no pipes)
     if (commands.size() == 1) {
         const std::string& cmd = commands[0][0];
-        // Execute built-ins in the parent process so `cd` and `exit` actually work
-        if (cmd == "cd" || cmd == "exit" || cmd == "help" || cmd == "pwd") {
+        if (cmd == "cd" || cmd == "exit" || cmd == "help" || cmd == "pwd" || cmd == "export") {
             execute_builtin(commands[0]);
             return;
         }
@@ -197,13 +242,11 @@ void execute_pipeline(const std::vector<std::string>& tokens) {
         return;
     }
 
-    // --- PIPELINE EXECUTION ---
     int prev_pipe_read_fd = -1;
     std::vector<pid_t> pids;
 
     for (size_t i = 0; i < commands.size(); ++i) {
         int pipefd[2];
-        // Create a pipe for all but the last command
         if (i < commands.size() - 1) {
             if (pipe(pipefd) < 0) {
                 perror("myshell: pipe failed");
@@ -218,47 +261,37 @@ void execute_pipeline(const std::vector<std::string>& tokens) {
         }
 
         if (pid == 0) {
-            // --- CHILD PROCESS ---
-            
-            // If there is a previous pipe, read from its read end
             if (prev_pipe_read_fd != -1) {
                 dup2(prev_pipe_read_fd, STDIN_FILENO);
                 close(prev_pipe_read_fd);
             }
-            
-            // If there is a current pipe, write to its write end
             if (i < commands.size() - 1) {
                 dup2(pipefd[1], STDOUT_FILENO);
-                close(pipefd[0]); // CRITICAL: Child must close the read end of the pipe it's writing to
-                close(pipefd[1]); // Close original FD after dup2
+                close(pipefd[0]); 
+                close(pipefd[1]); 
             }
             
             execute_single_command(commands[i], true);
-            exit(1); // Should never reach here
+            exit(1);
         } else {
-            // --- PARENT PROCESS ---
             pids.push_back(pid);
-            
-            // Parent must close the read end of the previous pipe since the child is now handling it
             if (prev_pipe_read_fd != -1) {
                 close(prev_pipe_read_fd);
             }
-            
-            // Parent must close the write end of the current pipe so EOF is sent when child finishes
             if (i < commands.size() - 1) {
                 close(pipefd[1]); 
-                prev_pipe_read_fd = pipefd[0]; // Save read end for the next iteration
+                prev_pipe_read_fd = pipefd[0];
             }
         }
     }
 
-    // Parent waits for ALL children in the pipeline to finish
     for (pid_t pid : pids) {
         waitpid(pid, nullptr, 0);
     }
 }
 
 int main() {
+    signal(SIGINT, SIG_IGN);
     std::string input;
 
     while (true) {

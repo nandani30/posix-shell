@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <fcntl.h>
 #include <csignal>
+#include <glob.h>
 
 std::vector<std::string> tokenize(const std::string& input) {
     std::vector<std::string> tokens;
@@ -61,6 +62,31 @@ std::vector<std::string> tokenize(const std::string& input) {
     }
 
     return tokens;
+}
+
+std::vector<std::string> expand_globs(const std::vector<std::string>& tokens) {
+    std::vector<std::string> expanded_tokens;
+    for (const auto& token : tokens) {
+        // If token contains a wildcard character OR starts with a tilde, try to expand it
+        if (token.find('*') != std::string::npos || 
+            token.find('?') != std::string::npos || 
+            (!token.empty() && token[0] == '~')) {
+            glob_t glob_result;
+            // GLOB_NOCHECK ensures that if no files match, the original pattern (e.g. *.xyz) is returned verbatim
+            // GLOB_TILDE adds ~ expansion as a nice bonus
+            if (glob(token.c_str(), GLOB_NOCHECK | GLOB_TILDE, nullptr, &glob_result) == 0) {
+                for (size_t i = 0; i < glob_result.gl_pathc; ++i) {
+                    expanded_tokens.push_back(std::string(glob_result.gl_pathv[i]));
+                }
+                globfree(&glob_result);
+            } else {
+                expanded_tokens.push_back(token); // Fallback
+            }
+        } else {
+            expanded_tokens.push_back(token);
+        }
+    }
+    return expanded_tokens;
 }
 
 bool execute_builtin(const std::vector<std::string>& tokens) {
@@ -308,6 +334,9 @@ int main() {
         }
 
         std::vector<std::string> tokens = tokenize(input);
+        
+        // Expand wildcards (*, ?) in the tokens before execution
+        tokens = expand_globs(tokens);
 
         if (!tokens.empty()) {
             execute_pipeline(tokens);

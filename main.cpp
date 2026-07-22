@@ -23,10 +23,8 @@ std::vector<std::string> tokenize(const std::string& input) {
         } else if (c == '"' && !in_single_quote) {
             in_double_quote = !in_double_quote;
         } else if (c == '$' && !in_single_quote) {
-            // Variable expansion (ignored if inside single quotes)
             std::string var_name;
             size_t j = i + 1;
-            // Variable names can contain alphanumeric characters and underscores
             while (j < input.length() && (std::isalnum(input[j]) || input[j] == '_')) {
                 var_name += input[j];
                 j++;
@@ -35,11 +33,10 @@ std::vector<std::string> tokenize(const std::string& input) {
             if (!var_name.empty()) {
                 const char* val = getenv(var_name.c_str());
                 if (val != nullptr) {
-                    current_token += val; // Append the expanded value
+                    current_token += val; 
                 }
-                i = j - 1; // Advance the outer loop iterator past the variable name
+                i = j - 1; 
             } else {
-                // A lone '$' sign
                 current_token += '$';
             }
         } else if (std::isspace(c) && !in_single_quote && !in_double_quote) {
@@ -67,20 +64,17 @@ std::vector<std::string> tokenize(const std::string& input) {
 std::vector<std::string> expand_globs(const std::vector<std::string>& tokens) {
     std::vector<std::string> expanded_tokens;
     for (const auto& token : tokens) {
-        // If token contains a wildcard character OR starts with a tilde, try to expand it
         if (token.find('*') != std::string::npos || 
             token.find('?') != std::string::npos || 
             (!token.empty() && token[0] == '~')) {
             glob_t glob_result;
-            // GLOB_NOCHECK ensures that if no files match, the original pattern (e.g. *.xyz) is returned verbatim
-            // GLOB_TILDE adds ~ expansion as a nice bonus
             if (glob(token.c_str(), GLOB_NOCHECK | GLOB_TILDE, nullptr, &glob_result) == 0) {
                 for (size_t i = 0; i < glob_result.gl_pathc; ++i) {
                     expanded_tokens.push_back(std::string(glob_result.gl_pathv[i]));
                 }
                 globfree(&glob_result);
             } else {
-                expanded_tokens.push_back(token); // Fallback
+                expanded_tokens.push_back(token); 
             }
         } else {
             expanded_tokens.push_back(token);
@@ -116,8 +110,6 @@ bool execute_builtin(const std::vector<std::string>& tokens) {
             if (eq_pos != std::string::npos) {
                 std::string key = arg.substr(0, eq_pos);
                 std::string value = arg.substr(eq_pos + 1);
-                // setenv sets the environment variable in the current process
-                // 1 means overwrite if it already exists
                 if (setenv(key.c_str(), value.c_str(), 1) != 0) {
                     perror("myshell: export");
                 }
@@ -130,7 +122,6 @@ bool execute_builtin(const std::vector<std::string>& tokens) {
     else if (cmd == "cd") {
         std::string target_dir;
         if (tokens.size() < 2) {
-            // Default to $HOME if no arguments are provided
             const char* home = getenv("HOME");
             if (home != nullptr) {
                 target_dir = home;
@@ -159,7 +150,7 @@ bool execute_builtin(const std::vector<std::string>& tokens) {
     return false;
 }
 
-void execute_single_command(const std::vector<std::string>& tokens, bool in_child_process) {
+void execute_single_command(const std::vector<std::string>& tokens, bool in_child_process, bool background) {
     if (tokens.empty()) {
         if (in_child_process) exit(0);
         return;
@@ -229,13 +220,17 @@ void execute_single_command(const std::vector<std::string>& tokens, bool in_chil
         } else if (pid == 0) {
             do_exec();
         } else {
-            int status;
-            waitpid(pid, &status, 0);
+            if (!background) {
+                int status;
+                waitpid(pid, &status, 0);
+            } else {
+                std::cout << "[Background] PID " << pid << "\n";
+            }
         }
     }
 }
 
-void execute_pipeline(const std::vector<std::string>& tokens) {
+void execute_pipeline(const std::vector<std::string>& tokens, bool background) {
     std::vector<std::vector<std::string>> commands;
     std::vector<std::string> current_command;
 
@@ -254,6 +249,9 @@ void execute_pipeline(const std::vector<std::string>& tokens) {
     }
     if (!current_command.empty()) {
         commands.push_back(current_command);
+    } else if (!tokens.empty() && tokens.back() == "|") {
+        std::cerr << "myshell: syntax error near unexpected token `|'\n";
+        return;
     }
 
     if (commands.empty()) return;
@@ -264,7 +262,7 @@ void execute_pipeline(const std::vector<std::string>& tokens) {
             execute_builtin(commands[0]);
             return;
         }
-        execute_single_command(commands[0], false);
+        execute_single_command(commands[0], false, background);
         return;
     }
 
@@ -297,7 +295,7 @@ void execute_pipeline(const std::vector<std::string>& tokens) {
                 close(pipefd[1]); 
             }
             
-            execute_single_command(commands[i], true);
+            execute_single_command(commands[i], true, background);
             exit(1);
         } else {
             pids.push_back(pid);
@@ -311,8 +309,14 @@ void execute_pipeline(const std::vector<std::string>& tokens) {
         }
     }
 
-    for (pid_t pid : pids) {
-        waitpid(pid, nullptr, 0);
+    if (!background) {
+        for (pid_t pid : pids) {
+            waitpid(pid, nullptr, 0);
+        }
+    } else {
+        if (!pids.empty()) {
+            std::cout << "[Background] Pipeline PID " << pids.back() << "\n";
+        }
     }
 }
 
@@ -321,6 +325,14 @@ int main() {
     std::string input;
 
     while (true) {
+        // Reap zombie processes in a non-blocking way
+        int status;
+        pid_t zombie_pid;
+        // WNOHANG tells waitpid to return immediately if no child has exited
+        while ((zombie_pid = waitpid(-1, &status, WNOHANG)) > 0) {
+            std::cout << "[Background] PID " << zombie_pid << " finished.\n";
+        }
+
         std::cout << "myshell> ";
         std::cout.flush();
 
@@ -334,12 +346,19 @@ int main() {
         }
 
         std::vector<std::string> tokens = tokenize(input);
-        
-        // Expand wildcards (*, ?) in the tokens before execution
         tokens = expand_globs(tokens);
 
         if (!tokens.empty()) {
-            execute_pipeline(tokens);
+            // Check for background operator '&' at the very end
+            bool background = false;
+            if (tokens.back() == "&") {
+                background = true;
+                tokens.pop_back(); // Remove the '&' so it doesn't get executed as an argument
+            }
+            
+            if (!tokens.empty()) {
+                execute_pipeline(tokens, background);
+            }
         }
     }
 

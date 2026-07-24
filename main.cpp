@@ -8,6 +8,136 @@
 #include <fcntl.h>
 #include <csignal>
 #include <glob.h>
+#include <termios.h>
+#include <algorithm>
+#include <fstream>
+
+// --- Job Control Globals ---
+struct Job {
+    int id;
+    pid_t pgid;
+    std::string command;
+    std::string status; 
+};
+std::vector<Job> job_table;
+int next_job_id = 1;
+pid_t shell_pgid;
+int shell_terminal;
+int shell_is_interactive;
+
+// --- History & Terminal Globals ---
+std::vector<std::string> history;
+struct termios orig_termios;
+bool raw_mode_enabled = false;
+
+void load_history() {
+    const char* home = getenv("HOME");
+    if (!home) return;
+    std::string path = std::string(home) + "/.myshell_history";
+    std::ifstream file(path);
+    std::string line;
+    while (std::getline(file, line)) {
+        if (!line.empty()) history.push_back(line);
+    }
+}
+
+void save_history() {
+    const char* home = getenv("HOME");
+    if (!home) return;
+    std::string path = std::string(home) + "/.myshell_history";
+    std::ofstream file(path);
+    for (const auto& line : history) {
+        file << line << "\n";
+    }
+}
+
+void disable_raw_mode() {
+    if (raw_mode_enabled) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
+        raw_mode_enabled = false;
+    }
+}
+
+void enable_raw_mode() {
+    if (!shell_is_interactive) return;
+    tcgetattr(STDIN_FILENO, &orig_termios);
+    struct termios raw = orig_termios;
+    raw.c_lflag &= ~(ECHO | ICANON | ISIG);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+    raw_mode_enabled = true;
+}
+
+bool read_line_with_history(std::string& input, const std::string& prompt) {
+    if (!shell_is_interactive) {
+        std::cout << prompt;
+        std::cout.flush();
+        return (bool)std::getline(std::cin, input);
+    }
+
+    input.clear();
+    int history_idx = history.size(); 
+    std::string current_buffer = "";
+    
+    std::cout << prompt;
+    std::cout.flush();
+    
+    char c;
+    while (read(STDIN_FILENO, &c, 1) == 1) {
+        if (c == '\n' || c == '\r') {
+            std::cout << "\n";
+            return true;
+        } else if (c == 3) { // Ctrl+C
+            std::cout << "^C\n";
+            input.clear();
+            return true; 
+        } else if (c == 4) { // Ctrl+D
+            if (input.empty()) return false;
+        } else if (c == 127 || c == 8) { // Backspace
+            if (!input.empty()) {
+                input.pop_back();
+                std::cout << "\b \b";
+                std::cout.flush();
+            }
+        } else if (c == '\x1b') { 
+            char seq[2];
+            if (read(STDIN_FILENO, &seq[0], 1) == 0) continue;
+            if (read(STDIN_FILENO, &seq[1], 1) == 0) continue;
+            
+            if (seq[0] == '[') {
+                if (seq[1] == 'A') { // Up
+                    if (history_idx > 0) {
+                        if (history_idx == (int)history.size()) current_buffer = input; 
+                        history_idx--;
+                        for (size_t i = 0; i < input.length(); ++i) std::cout << "\b \b";
+                        input = history[history_idx];
+                        std::cout << input;
+                        std::cout.flush();
+                    }
+                } else if (seq[1] == 'B') { // Down
+                    if (history_idx < (int)history.size()) {
+                        history_idx++;
+                        for (size_t i = 0; i < input.length(); ++i) std::cout << "\b \b";
+                        if (history_idx == (int)history.size()) input = current_buffer;
+                        else input = history[history_idx];
+                        std::cout << input;
+                        std::cout.flush();
+                    }
+                }
+            }
+        } else if (c >= 32 && c <= 126) { 
+            input += c;
+            std::cout << c;
+            std::cout.flush();
+        }
+    }
+    return false;
+}
+
+void add_job(pid_t pgid, const std::string& command, const std::string& status) {
+    job_table.push_back({next_job_id++, pgid, command, status});
+}
 
 char get_open_quote(const std::string& input) {
     bool in_single_quote = false;
@@ -120,6 +250,8 @@ int execute_builtin(const std::vector<std::string>& tokens) {
 
     if (cmd == "exit") {
         std::cout << "Exiting myshell...\n";
+        save_history();
+        disable_raw_mode();
         exit(0);
     } 
     else if (cmd == "help") {
@@ -128,10 +260,65 @@ int execute_builtin(const std::vector<std::string>& tokens) {
         std::cout << "  cd [dir]       - Change the current directory\n";
         std::cout << "  pwd            - Print the current working directory\n";
         std::cout << "  export KEY=VAL - Set an environment variable\n";
+        std::cout << "  jobs           - List background and stopped jobs\n";
+        std::cout << "  fg %N          - Bring job N to foreground\n";
+        std::cout << "  bg %N          - Resume job N in background\n";
         std::cout << "  help           - Show this help message\n";
         std::cout << "  exit           - Exit the shell\n";
         return 0;
     } 
+    else if (cmd == "jobs") {
+        for (const auto& job : job_table) {
+            std::cout << "[" << job.id << "] " << job.status << "\t\t" << job.command << "\n";
+        }
+        return 0;
+    }
+    else if (cmd == "fg" || cmd == "bg") {
+        if (tokens.size() < 2 || tokens[1][0] != '%') {
+            std::cerr << "myshell: " << cmd << ": usage: " << cmd << " %N\n";
+            return 1;
+        }
+        int job_id = std::stoi(tokens[1].substr(1));
+        
+        auto it = std::find_if(job_table.begin(), job_table.end(), [job_id](const Job& j) { return j.id == job_id; });
+        if (it == job_table.end()) {
+            std::cerr << "myshell: " << cmd << ": %" << job_id << ": no such job\n";
+            return 1;
+        }
+        
+        pid_t pgid = it->pgid;
+        std::string command = it->command;
+        
+        if (cmd == "fg") {
+            it->status = "Running";
+            std::cout << command << "\n";
+            
+            if (shell_is_interactive) {
+                tcsetpgrp(shell_terminal, pgid);
+            }
+            
+            kill(-pgid, SIGCONT);
+            
+            int status;
+            waitpid(pgid, &status, WUNTRACED);
+            if (WIFSTOPPED(status)) {
+                std::cout << "\n[" << job_id << "]+  Stopped                 " << command << "\n";
+                it->status = "Stopped";
+            } else {
+                job_table.erase(it);
+            }
+            
+            if (shell_is_interactive) {
+                tcsetpgrp(shell_terminal, shell_pgid);
+            }
+            return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+        } else {
+            it->status = "Running";
+            std::cout << "[" << job_id << "]+ " << command << " &\n";
+            kill(-pgid, SIGCONT);
+            return 0;
+        }
+    }
     else if (cmd == "export") {
         if (tokens.size() < 2) {
             std::cerr << "myshell: export: missing argument\n";
@@ -183,7 +370,7 @@ int execute_builtin(const std::vector<std::string>& tokens) {
             return 1;
         }
     }
-    return 127; // Command not found
+    return 127; 
 }
 
 int execute_single_command(const std::vector<std::string>& tokens, bool in_child_process, bool background) {
@@ -196,8 +383,10 @@ int execute_single_command(const std::vector<std::string>& tokens, bool in_child
     std::string input_file = "";
     std::string output_file = "";
     bool append_output = false;
+    std::string cmd_str = "";
 
     for (size_t i = 0; i < tokens.size(); ++i) {
+        cmd_str += tokens[i] + " ";
         if (tokens[i] == "<") {
             if (i + 1 < tokens.size()) { input_file = tokens[i + 1]; ++i; }
             else { std::cerr << "myshell: syntax error\n"; if (in_child_process) exit(1); return 1; }
@@ -218,8 +407,30 @@ int execute_single_command(const std::vector<std::string>& tokens, bool in_child
     }
     args.push_back(nullptr);
 
-    auto do_exec = [&]() {
-        signal(SIGINT, SIG_DFL);
+    const std::string& cmd = tokens[0];
+    if (!in_child_process) {
+        if (cmd == "cd" || cmd == "exit" || cmd == "help" || cmd == "pwd" || cmd == "export" || cmd == "jobs" || cmd == "fg" || cmd == "bg") {
+            return execute_builtin(tokens);
+        }
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        std::cerr << "myshell: fork failed\n";
+        return 1;
+    } else if (pid == 0) {
+        if (shell_is_interactive) {
+            pid_t child_pid = getpid();
+            setpgid(child_pid, child_pid);
+            if (!background) {
+                tcsetpgrp(shell_terminal, child_pid);
+            }
+            signal(SIGINT, SIG_DFL);
+            signal(SIGQUIT, SIG_DFL);
+            signal(SIGTSTP, SIG_DFL);
+            signal(SIGTTIN, SIG_DFL);
+            signal(SIGTTOU, SIG_DFL);
+        }
 
         if (!input_file.empty()) {
             int fd0 = open(input_file.c_str(), O_RDONLY);
@@ -237,9 +448,7 @@ int execute_single_command(const std::vector<std::string>& tokens, bool in_child
 
         std::vector<std::string> clean_tokens;
         for (int i = 0; args[i] != nullptr; ++i) clean_tokens.push_back(args[i]);
-        
-        const std::string& cmd = clean_tokens[0];
-        if (cmd == "cd" || cmd == "exit" || cmd == "help" || cmd == "pwd" || cmd == "export") {
+        if (cmd == "cd" || cmd == "exit" || cmd == "help" || cmd == "pwd" || cmd == "export" || cmd == "jobs" || cmd == "fg" || cmd == "bg") {
             exit(execute_builtin(clean_tokens));
         }
 
@@ -247,37 +456,36 @@ int execute_single_command(const std::vector<std::string>& tokens, bool in_child
             std::cerr << "myshell: " << args[0] << ": command not found\n";
             exit(127); 
         }
-    };
-
-    if (in_child_process) {
-        do_exec();
-        return 0; // Should never reach here
+        exit(1);
     } else {
-        const std::string& cmd = tokens[0];
-        // Execute builtin in parent process if it's the only command
-        if (cmd == "cd" || cmd == "exit" || cmd == "help" || cmd == "pwd" || cmd == "export") {
-            return execute_builtin(tokens);
+        if (shell_is_interactive) {
+            setpgid(pid, pid);
         }
 
-        pid_t pid = fork();
-        if (pid < 0) {
-            std::cerr << "myshell: fork failed\n";
-            return 1;
-        } else if (pid == 0) {
-            do_exec();
-            exit(1);
-        } else {
-            if (!background) {
-                int status;
-                waitpid(pid, &status, 0);
-                if (WIFEXITED(status)) {
-                    return WEXITSTATUS(status);
-                }
-                return 1;
-            } else {
-                std::cout << "[Background] PID " << pid << "\n";
-                return 0; // Background process technically detached, assume 0 for immediate return
+        if (!background) {
+            if (shell_is_interactive) {
+                tcsetpgrp(shell_terminal, pid);
             }
+            
+            int status;
+            waitpid(pid, &status, WUNTRACED);
+            
+            if (shell_is_interactive) {
+                tcsetpgrp(shell_terminal, shell_pgid);
+            }
+
+            if (WIFSTOPPED(status)) {
+                std::cout << "\n[" << next_job_id << "]+  Stopped                 " << cmd_str << "\n";
+                add_job(pid, cmd_str, "Stopped");
+                return 148; 
+            } else if (WIFEXITED(status)) {
+                return WEXITSTATUS(status);
+            }
+            return 1;
+        } else {
+            add_job(pid, cmd_str, "Running");
+            std::cout << "[" << (next_job_id - 1) << "] " << pid << "\n";
+            return 0; 
         }
     }
 }
@@ -285,8 +493,10 @@ int execute_single_command(const std::vector<std::string>& tokens, bool in_child
 int execute_pipeline(const std::vector<std::string>& tokens, bool background) {
     std::vector<std::vector<std::string>> commands;
     std::vector<std::string> current_command;
+    std::string full_cmd_str = "";
 
     for (const auto& token : tokens) {
+        full_cmd_str += token + " ";
         if (token == "|") {
             if (!current_command.empty()) {
                 commands.push_back(current_command);
@@ -314,6 +524,7 @@ int execute_pipeline(const std::vector<std::string>& tokens, bool background) {
 
     int prev_pipe_read_fd = -1;
     std::vector<pid_t> pids;
+    pid_t pgid = 0;
 
     for (size_t i = 0; i < commands.size(); ++i) {
         int pipefd[2];
@@ -331,6 +542,20 @@ int execute_pipeline(const std::vector<std::string>& tokens, bool background) {
         }
 
         if (pid == 0) {
+            if (shell_is_interactive) {
+                pid_t child_pid = getpid();
+                if (pgid == 0) pgid = child_pid;
+                setpgid(child_pid, pgid);
+                if (!background) {
+                    tcsetpgrp(shell_terminal, pgid);
+                }
+                signal(SIGINT, SIG_DFL);
+                signal(SIGQUIT, SIG_DFL);
+                signal(SIGTSTP, SIG_DFL);
+                signal(SIGTTIN, SIG_DFL);
+                signal(SIGTTOU, SIG_DFL);
+            }
+
             if (prev_pipe_read_fd != -1) {
                 dup2(prev_pipe_read_fd, STDIN_FILENO);
                 close(prev_pipe_read_fd);
@@ -344,6 +569,10 @@ int execute_pipeline(const std::vector<std::string>& tokens, bool background) {
             int status = execute_single_command(commands[i], true, background);
             exit(status);
         } else {
+            if (shell_is_interactive) {
+                if (pgid == 0) pgid = pid;
+                setpgid(pid, pgid);
+            }
             pids.push_back(pid);
             if (prev_pipe_read_fd != -1) {
                 close(prev_pipe_read_fd);
@@ -357,25 +586,37 @@ int execute_pipeline(const std::vector<std::string>& tokens, bool background) {
 
     int final_status = 0;
     if (!background) {
+        if (shell_is_interactive) {
+            tcsetpgrp(shell_terminal, pgid);
+        }
+
         for (pid_t pid : pids) {
             int status;
-            waitpid(pid, &status, 0);
-            if (pid == pids.back()) {
+            waitpid(pid, &status, WUNTRACED);
+            if (WIFSTOPPED(status)) {
+                if (pid == pids.back()) {
+                    std::cout << "\n[" << next_job_id << "]+  Stopped                 " << full_cmd_str << "\n";
+                    add_job(pgid, full_cmd_str, "Stopped");
+                    final_status = 148;
+                }
+            } else if (pid == pids.back()) {
                 if (WIFEXITED(status)) final_status = WEXITSTATUS(status);
                 else final_status = 1;
             }
         }
-    } else {
-        if (!pids.empty()) {
-            std::cout << "[Background] Pipeline PID " << pids.back() << "\n";
+
+        if (shell_is_interactive) {
+            tcsetpgrp(shell_terminal, shell_pgid);
         }
+    } else {
+        add_job(pgid, full_cmd_str, "Running");
+        std::cout << "[" << (next_job_id - 1) << "] " << pids.back() << "\n";
     }
     return final_status;
 }
 
 int execute_chains(const std::vector<std::string>& tokens, bool background) {
     std::vector<std::string> current_chunk;
-    std::string next_op = "";
     int last_status = 0;
     bool skip_chunk = false;
 
@@ -388,7 +629,6 @@ int execute_chains(const std::vector<std::string>& tokens, bool background) {
                 current_chunk.clear();
             }
 
-            // Decide whether to skip the next chunk based on last_status
             if (tokens[i] == "&&") {
                 skip_chunk = (last_status != 0);
             } else if (tokens[i] == "||") {
@@ -409,22 +649,54 @@ int execute_chains(const std::vector<std::string>& tokens, bool background) {
 }
 
 int main() {
-    signal(SIGINT, SIG_IGN);
+    shell_terminal = STDIN_FILENO;
+    shell_is_interactive = isatty(shell_terminal);
+
+    if (shell_is_interactive) {
+        while (tcgetpgrp(shell_terminal) != (shell_pgid = getpgrp()))
+            kill(-shell_pgid, SIGTTIN);
+
+        signal(SIGINT, SIG_IGN);
+        signal(SIGQUIT, SIG_IGN);
+        signal(SIGTSTP, SIG_IGN);
+        signal(SIGTTIN, SIG_IGN);
+        signal(SIGTTOU, SIG_IGN);
+
+        shell_pgid = getpid();
+        if (setpgid(shell_pgid, shell_pgid) < 0) {
+            perror("Couldn't put the shell in its own process group");
+            exit(1);
+        }
+
+        tcsetpgrp(shell_terminal, shell_pgid);
+        load_history();
+    }
 
     while (true) {
         int status;
         pid_t zombie_pid;
-        while ((zombie_pid = waitpid(-1, &status, WNOHANG)) > 0) {
-            std::cout << "[Background] PID " << zombie_pid << " finished.\n";
+        while ((zombie_pid = waitpid(-1, &status, WNOHANG | WUNTRACED | WCONTINUED)) > 0) {
+            auto it = std::find_if(job_table.begin(), job_table.end(), 
+                [zombie_pid](const Job& j) { return j.pgid == zombie_pid || j.pgid == getpgid(zombie_pid); });
+            
+            if (it != job_table.end()) {
+                if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                    std::cout << "\n[" << it->id << "]+  Done                    " << it->command << "\n";
+                    job_table.erase(it);
+                } else if (WIFSTOPPED(status)) {
+                    it->status = "Stopped";
+                }
+            }
         }
 
         std::string full_input;
         std::string input;
         
-        std::cout << "myshell> ";
-        std::cout.flush();
-
-        if (!std::getline(std::cin, input)) {
+        enable_raw_mode();
+        bool ok = read_line_with_history(input, "myshell> ");
+        disable_raw_mode();
+        
+        if (!ok) {
             std::cout << "\n";
             break;
         }
@@ -433,12 +705,12 @@ int main() {
 
         char open_quote = get_open_quote(full_input);
         while (open_quote != '\0') {
-            if (open_quote == '"') std::cout << "dquote> ";
-            else std::cout << "quote> ";
-            std::cout.flush();
-            
             std::string next_line;
-            if (!std::getline(std::cin, next_line)) {
+            enable_raw_mode();
+            bool cont_ok = read_line_with_history(next_line, (open_quote == '"') ? "dquote> " : "quote> ");
+            disable_raw_mode();
+            
+            if (!cont_ok) {
                 std::cout << "\nmyshell: unexpected EOF while looking for matching `" << open_quote << "'\n";
                 break; 
             }
@@ -452,6 +724,10 @@ int main() {
 
         if (full_input.empty()) {
             continue;
+        }
+        
+        if (shell_is_interactive) {
+            history.push_back(full_input);
         }
 
         std::vector<std::string> tokens = tokenize(full_input);
@@ -470,5 +746,8 @@ int main() {
         }
     }
 
+    if (shell_is_interactive) {
+        save_history();
+    }
     return 0;
 }

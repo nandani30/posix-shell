@@ -11,6 +11,9 @@
 #include <termios.h>
 #include <algorithm>
 #include <fstream>
+#include <unordered_map>
+#include <dirent.h>
+#include <cstring>
 
 // --- Job Control Globals ---
 struct Job {
@@ -25,10 +28,111 @@ pid_t shell_pgid;
 int shell_terminal;
 int shell_is_interactive;
 
-// --- History & Terminal Globals ---
+// --- History, Terminal & Polish Globals ---
 std::vector<std::string> history;
 struct termios orig_termios;
 bool raw_mode_enabled = false;
+std::unordered_map<std::string, std::string> aliases;
+
+std::string get_prompt() {
+    char cwd[1024];
+    std::string prompt_str = "";
+    if (getcwd(cwd, sizeof(cwd)) != nullptr) {
+        std::string cwd_str(cwd);
+        const char* home = getenv("HOME");
+        if (home && cwd_str.find(home) == 0) {
+            cwd_str.replace(0, strlen(home), "~");
+        }
+        prompt_str += "\033[1;36m[" + cwd_str + "]\033[0m ";
+    }
+    
+    FILE* pipe = popen("git rev-parse --abbrev-ref HEAD 2>/dev/null", "r");
+    if (pipe) {
+        char buffer[128];
+        std::string result = "";
+        while (!feof(pipe)) {
+            if (fgets(buffer, 128, pipe) != NULL)
+                result += buffer;
+        }
+        pclose(pipe);
+        if (!result.empty()) {
+            result.erase(result.find_last_not_of(" \n\r\t") + 1);
+            prompt_str += "\033[1;35m(" + result + ")\033[0m ";
+        }
+    }
+    prompt_str += "myshell> ";
+    return prompt_str;
+}
+
+std::vector<std::string> get_completions(const std::string& prefix, bool is_first_word) {
+    std::vector<std::string> matches;
+    if (is_first_word) {
+        std::vector<std::string> builtins = {"cd", "exit", "help", "pwd", "export", "jobs", "fg", "bg", "alias", "unalias"};
+        for (const auto& b : builtins) {
+            if (b.find(prefix) == 0) matches.push_back(b);
+        }
+        for (const auto& p : aliases) {
+            if (p.first.find(prefix) == 0) matches.push_back(p.first);
+        }
+        const char* path_env = getenv("PATH");
+        if (path_env) {
+            std::string path_str = path_env;
+            size_t start = 0;
+            size_t end = path_str.find(':');
+            while (end != std::string::npos || start < path_str.length()) {
+                std::string dir;
+                if (end != std::string::npos) {
+                    dir = path_str.substr(start, end - start);
+                    start = end + 1;
+                    end = path_str.find(':', start);
+                } else {
+                    dir = path_str.substr(start);
+                    start = path_str.length();
+                }
+                
+                DIR* dp = opendir(dir.c_str());
+                if (dp) {
+                    struct dirent* ep;
+                    while ((ep = readdir(dp))) {
+                        std::string name = ep->d_name;
+                        if (name == "." || name == "..") continue;
+                        if (name.find(prefix) == 0) matches.push_back(name);
+                    }
+                    closedir(dp);
+                }
+            }
+        }
+        std::sort(matches.begin(), matches.end());
+        matches.erase(std::unique(matches.begin(), matches.end()), matches.end());
+    } else {
+        size_t slash = prefix.find_last_of('/');
+        std::string dir_path = ".";
+        std::string search_prefix = prefix;
+        if (slash != std::string::npos) {
+            dir_path = prefix.substr(0, slash);
+            search_prefix = prefix.substr(slash + 1);
+            if (dir_path.empty()) dir_path = "/";
+        }
+        
+        DIR* dp = opendir(dir_path.c_str());
+        if (dp) {
+            struct dirent* ep;
+            while ((ep = readdir(dp))) {
+                std::string name = ep->d_name;
+                if (name == "." || name == "..") continue;
+                if (name.find(search_prefix) == 0) {
+                    if (slash != std::string::npos) {
+                        matches.push_back(prefix.substr(0, slash + 1) + name);
+                    } else {
+                        matches.push_back(name);
+                    }
+                }
+            }
+            closedir(dp);
+        }
+    }
+    return matches;
+}
 
 void load_history() {
     const char* home = getenv("HOME");
@@ -98,6 +202,22 @@ bool read_line_with_history(std::string& input, const std::string& prompt) {
             if (!input.empty()) {
                 input.pop_back();
                 std::cout << "\b \b";
+                std::cout.flush();
+            }
+        } else if (c == 9) { // Tab
+            size_t last_space = input.find_last_of(" \t");
+            bool is_first = (last_space == std::string::npos);
+            std::string current_word = is_first ? input : input.substr(last_space + 1);
+            
+            std::vector<std::string> matches = get_completions(current_word, is_first);
+            if (matches.size() == 1) {
+                std::string match = matches[0];
+                std::string remainder = match.substr(current_word.length());
+                if (!is_first || (is_first && matches[0].find('/') == std::string::npos)) {
+                    remainder += " ";
+                }
+                input += remainder;
+                std::cout << remainder;
                 std::cout.flush();
             }
         } else if (c == '\x1b') { 
@@ -263,10 +383,42 @@ int execute_builtin(const std::vector<std::string>& tokens) {
         std::cout << "  jobs           - List background and stopped jobs\n";
         std::cout << "  fg %N          - Bring job N to foreground\n";
         std::cout << "  bg %N          - Resume job N in background\n";
+        std::cout << "  alias n='c'    - Set an alias\n";
+        std::cout << "  unalias n      - Remove an alias\n";
         std::cout << "  help           - Show this help message\n";
         std::cout << "  exit           - Exit the shell\n";
         return 0;
     } 
+    else if (cmd == "alias") {
+        if (tokens.size() == 1) {
+            for (const auto& pair : aliases) {
+                std::cout << "alias " << pair.first << "='" << pair.second << "'\n";
+            }
+        } else {
+            std::string arg = tokens[1];
+            size_t eq_pos = arg.find('=');
+            if (eq_pos != std::string::npos) {
+                std::string name = arg.substr(0, eq_pos);
+                std::string val = arg.substr(eq_pos + 1);
+                if (val.length() >= 2 && ((val.front() == '\'' && val.back() == '\'') || (val.front() == '"' && val.back() == '"'))) {
+                    val = val.substr(1, val.length() - 2);
+                }
+                aliases[name] = val;
+            } else {
+                std::cerr << "myshell: alias: invalid format (expected name='command')\n";
+                return 1;
+            }
+        }
+        return 0;
+    }
+    else if (cmd == "unalias") {
+        if (tokens.size() < 2) {
+            std::cerr << "myshell: unalias: missing argument\n";
+            return 1;
+        }
+        aliases.erase(tokens[1]);
+        return 0;
+    }
     else if (cmd == "jobs") {
         for (const auto& job : job_table) {
             std::cout << "[" << job.id << "] " << job.status << "\t\t" << job.command << "\n";
@@ -409,7 +561,7 @@ int execute_single_command(const std::vector<std::string>& tokens, bool in_child
 
     const std::string& cmd = tokens[0];
     if (!in_child_process) {
-        if (cmd == "cd" || cmd == "exit" || cmd == "help" || cmd == "pwd" || cmd == "export" || cmd == "jobs" || cmd == "fg" || cmd == "bg") {
+        if (cmd == "cd" || cmd == "exit" || cmd == "help" || cmd == "pwd" || cmd == "export" || cmd == "jobs" || cmd == "fg" || cmd == "bg" || cmd == "alias" || cmd == "unalias") {
             return execute_builtin(tokens);
         }
     }
@@ -448,7 +600,7 @@ int execute_single_command(const std::vector<std::string>& tokens, bool in_child
 
         std::vector<std::string> clean_tokens;
         for (int i = 0; args[i] != nullptr; ++i) clean_tokens.push_back(args[i]);
-        if (cmd == "cd" || cmd == "exit" || cmd == "help" || cmd == "pwd" || cmd == "export" || cmd == "jobs" || cmd == "fg" || cmd == "bg") {
+        if (cmd == "cd" || cmd == "exit" || cmd == "help" || cmd == "pwd" || cmd == "export" || cmd == "jobs" || cmd == "fg" || cmd == "bg" || cmd == "alias" || cmd == "unalias") {
             exit(execute_builtin(clean_tokens));
         }
 
@@ -693,7 +845,7 @@ int main() {
         std::string input;
         
         enable_raw_mode();
-        bool ok = read_line_with_history(input, "myshell> ");
+        bool ok = read_line_with_history(input, get_prompt());
         disable_raw_mode();
         
         if (!ok) {
@@ -731,6 +883,17 @@ int main() {
         }
 
         std::vector<std::string> tokens = tokenize(full_input);
+        
+        // Alias Expansion
+        if (!tokens.empty()) {
+            auto it = aliases.find(tokens[0]);
+            if (it != aliases.end()) {
+                std::vector<std::string> expanded = tokenize(it->second);
+                tokens.erase(tokens.begin());
+                tokens.insert(tokens.begin(), expanded.begin(), expanded.end());
+            }
+        }
+
         tokens = expand_globs(tokens);
 
         if (!tokens.empty()) {

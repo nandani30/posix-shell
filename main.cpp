@@ -768,6 +768,39 @@ int execute_pipeline(const std::vector<std::string>& tokens, bool background) {
 }
 
 int execute_chains(const std::vector<std::string>& tokens, bool background) {
+    bool has_chain = false;
+    for (const auto& t : tokens) {
+        if (t == "&&" || t == "||" || t == ";") { has_chain = true; break; }
+    }
+
+    // If no chain operators, let execute_pipeline handle backgrounding natively
+    if (!has_chain) {
+        return execute_pipeline(tokens, background);
+    }
+
+    // If there ARE chain operators AND it's a background task, 
+    // we fork a subshell to manage the sequential chain asynchronously.
+    if (background) {
+        std::string full_cmd_str = "";
+        for (const auto& t : tokens) full_cmd_str += t + " ";
+        full_cmd_str += "&";
+        
+        pid_t pid = fork();
+        if (pid == 0) {
+            shell_is_interactive = 0; // Disable terminal hijacking in the background
+            setpgid(0, 0); 
+            exit(execute_chains(tokens, false)); // Execute synchronously in child
+        } else if (pid > 0) {
+            setpgid(pid, pid);
+            add_job(pid, full_cmd_str, "Running");
+            std::cout << "[" << (next_job_id - 1) << "] " << pid << "\n";
+            return 0;
+        } else {
+            perror("myshell: fork failed");
+            return 1;
+        }
+    }
+
     std::vector<std::string> current_chunk;
     int last_status = 0;
     bool skip_chunk = false;
@@ -776,7 +809,7 @@ int execute_chains(const std::vector<std::string>& tokens, bool background) {
         if (tokens[i] == "&&" || tokens[i] == "||" || tokens[i] == ";") {
             if (!current_chunk.empty()) {
                 if (!skip_chunk) {
-                    last_status = execute_pipeline(current_chunk, background);
+                    last_status = execute_pipeline(current_chunk, false); // Always false here!
                 }
                 current_chunk.clear();
             }
@@ -794,7 +827,7 @@ int execute_chains(const std::vector<std::string>& tokens, bool background) {
     }
 
     if (!current_chunk.empty() && !skip_chunk) {
-        last_status = execute_pipeline(current_chunk, background);
+        last_status = execute_pipeline(current_chunk, false);
     }
 
     return last_status;

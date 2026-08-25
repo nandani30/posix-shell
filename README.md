@@ -1,4 +1,3 @@
-# myshell
 
 A custom Unix shell written in C++ on macOS.
 
